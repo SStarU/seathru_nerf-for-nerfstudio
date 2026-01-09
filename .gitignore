@@ -3,3 +3,6 @@ outputs/*
 seathru_nerf.egg-info/*
 .vscode/*
 */__pycache__/*
+seathru/outputs/
+outputs/
+**/outputs/
