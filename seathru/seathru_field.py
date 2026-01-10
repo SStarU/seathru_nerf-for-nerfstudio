@@ -67,6 +67,9 @@ class SeathruField(Field):
         use_viewing_dir_obj_rgb: bool = False,
         object_density_bias: float = 0.0,
         medium_density_bias: float = 0.0,
+        num_cameras: int = 0,
+        use_medium_c1: bool = False,
+        medium_delta_dim: int = 8,
     ) -> None:
         super().__init__()
 
@@ -138,6 +141,26 @@ class SeathruField(Field):
             out_activation=None,
             implementation=implementation,
         )
+
+        # ------------------------Medium C1 (global + per-image residual)------------------------
+        self.use_medium_c1 = use_medium_c1
+        self.num_cameras = int(num_cameras)
+
+        if self.use_medium_c1:
+            if self.num_cameras <= 0:
+                raise ValueError("num_cameras must be > 0 when use_medium_c1=True")
+
+            # Pre-activation bias for [rgb(3), bs(3), attn(3)]
+            self.medium_global_pre = nn.Parameter(torch.zeros(9))
+
+            # Per-image residual embedding -> 9D pre-activation bias
+            self.medium_delta_embed = nn.Embedding(self.num_cameras, medium_delta_dim)
+            self.medium_delta_proj = nn.Linear(medium_delta_dim, 9, bias=False)
+
+            # Small random init avoids a zero-gradient deadlock.
+            nn.init.normal_(self.medium_delta_embed.weight, mean=0.0, std=1e-4)
+            nn.init.normal_(self.medium_delta_proj.weight, mean=0.0, std=1e-4)
+            self._c1_logged = False
 
     def get_density(self, ray_samples: RaySamples) -> Tuple[Tensor, Tensor]:
         """Compute output of object base MLP. (This function builds on the nerfacto
@@ -222,6 +245,33 @@ class SeathruField(Field):
 
         # Medium MLP forward pass
         medium_base_out = self.medium_mlp(directions_encoded)
+
+        # C1: add global + per-image pre-activation bias
+        if self.use_medium_c1:
+            cam_idx = ray_samples.camera_indices
+            if cam_idx is None:
+                raise RuntimeError(
+                    "ray_samples.camera_indices is None; C1 requires camera_indices to "
+                    "index per-image embedding."
+                )
+            cam_idx = cam_idx.reshape(-1).to(device=medium_base_out.device, dtype=torch.long)
+
+            if not self._c1_logged:
+                print(f"[C1] cam_idx.max()={int(cam_idx.max())}, num_cameras={self.num_cameras}")
+                self._c1_logged = True
+
+            # Safety checks (fail fast if indexing is inconsistent)
+            if cam_idx.numel() > 0:
+                if int(cam_idx.min()) < 0 or int(cam_idx.max()) >= self.num_cameras:
+                    raise RuntimeError(
+                        f"camera_indices out of range: min={int(cam_idx.min())}, "
+                        f"max={int(cam_idx.max())}, num_cameras={self.num_cameras}. "
+                        "Check SeathruModelConfig.num_cameras."
+                    )
+
+            delta9 = self.medium_delta_proj(self.medium_delta_embed(cam_idx))
+            bias9 = self.medium_global_pre.unsqueeze(0) + delta9
+            medium_base_out = medium_base_out + bias9
 
         # different activations for different outputs
         medium_rgb = (

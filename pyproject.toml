@@ -49,5 +49,9 @@ ignore = [
 ]
 
 [project.entry-points.'nerfstudio.method_configs']
-seathru = "seathru.seathru_config:seathru_method"
-seathru2 = "seathru.seathru_config:seathru_method_lite"
+seathru-nerf = "seathru.seathru_config:seathru_method"
+seathru-nerf-c1 = "seathru.seathru_config:seathru_method_c1"
+seathru-nerf-c1b = "seathru.seathru_config:seathru_method_c1b"
+seathru-nerf-lite = "seathru.seathru_config:seathru_method_lite"
+seathru-nerf-lite-c1 = "seathru.seathru_config:seathru_method_lite_c1"
+seathru-nerf-lite-c1b = "seathru.seathru_config:seathru_method_lite_c1b"

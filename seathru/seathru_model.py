@@ -77,6 +77,20 @@ class SeathruModelConfig(ModelConfig):
     """Bias for object density."""
     medium_density_bias: float = 0.0
     """Bias for medium density (sigma_bs and sigma_attn)."""
+    use_medium_c1: bool = False
+    """Whether to use global + per-image medium pre-activation bias (C1)."""
+    use_plan_b: bool = False
+    """Whether to enable plan B variant for SeaThru."""
+    medium_delta_dim: int = 8
+    """Embedding dimension for per-image medium residuals."""
+    lambda_delta: float = 1e-3
+    """L2 regularization weight for per-image medium residuals."""
+    lambda_zm: float = 1e-2
+    """Zero-mean regularization weight for per-image medium residuals."""
+    num_cameras: int = 0
+    """Number of cameras/images for per-image medium residuals. 0 = auto."""
+    max_num_cameras: int = 8192
+    """Fallback number of cameras/images when auto-detection fails."""
     num_proposal_samples_per_ray: Tuple[int, ...] = (256, 128)
     """Number of samples per ray for each proposal network."""
     num_nerf_samples_per_ray: int = 64
@@ -167,6 +181,19 @@ class SeathruModel(Model):
             scene_contraction = SceneContraction(order=float("inf"))
 
         # Initialize SeaThru field
+        num_cameras = 0
+        if self.config.use_medium_c1:
+            if self.config.num_cameras and self.config.num_cameras > 0:
+                num_cameras = int(self.config.num_cameras)
+            else:
+                # Try to infer from available attributes across nerfstudio versions.
+                for name in ["num_train_data", "num_eval_data", "num_cameras", "num_images"]:
+                    v = getattr(self, name, None)
+                    if isinstance(v, int) and v > 0:
+                        num_cameras = int(v)
+                        break
+                if num_cameras <= 0:
+                    num_cameras = int(self.config.max_num_cameras)
         self.field = SeathruField(
             aabb=self.scene_box.aabb,
             num_levels=self.config.num_levels,
@@ -186,6 +213,9 @@ class SeathruModel(Model):
             use_viewing_dir_obj_rgb=self.config.use_viewing_dir_obj_rgb,
             object_density_bias=self.config.object_density_bias,
             medium_density_bias=self.config.medium_density_bias,
+            num_cameras=num_cameras if self.config.use_medium_c1 else 0,
+            use_medium_c1=self.config.use_medium_c1,
+            medium_delta_dim=self.config.medium_delta_dim,
         )
 
         # Initialize proposal network(s) (this code snippet is taken from from nerfacto)
@@ -502,6 +532,45 @@ class SeathruModel(Model):
                 self.config.interlevel_loss_mult
                 * interlevel_loss(outputs["weights_list"], outputs["ray_samples_list"])
             )
+            # ---- C1 regularization ----
+            if self.config.use_medium_c1 and getattr(self.field, "use_medium_c1", False):
+                cam_idx = batch["indices"][:, 0].to(self.device)
+                if not hasattr(self, "_max_seen_camera_idx"):
+                    self._max_seen_camera_idx = 0
+                self._max_seen_camera_idx = max(
+                    self._max_seen_camera_idx, int(cam_idx.max().item())
+                )
+                used_n = self._max_seen_camera_idx + 1
+                delta9_used = self.field.medium_delta_proj(
+                    self.field.medium_delta_embed.weight[:used_n]
+                )
+                loss_dict["medium_delta_l2"] = self.config.lambda_delta * (delta9_used ** 2).mean()
+                loss_dict["medium_delta_zeromean"] = (
+                    self.config.lambda_zm * (delta9_used.mean(dim=0) ** 2).sum()
+                )
+        # ---- C1 stats logging (delta_rms / global_rms) ----
+        if self.config.use_medium_c1 and getattr(self.field, "use_medium_c1", False):
+            # 1) global rms
+            global_rms = torch.sqrt((self.field.medium_global_pre ** 2).mean())
+
+            # 2) delta rms (only over used cameras)
+            cam_idx = batch["indices"][:, 0].to(self.device)
+            if not hasattr(self, "_max_seen_camera_idx"):
+                self._max_seen_camera_idx = 0
+            self._max_seen_camera_idx = max(
+                self._max_seen_camera_idx, int(cam_idx.max().item())
+            )
+            used_n = self._max_seen_camera_idx + 1
+
+            delta9_used = self.field.medium_delta_proj(
+                self.field.medium_delta_embed.weight[:used_n]
+            )
+            delta_rms = torch.sqrt((delta9_used ** 2).mean())
+
+            # Write into metrics_dict (viewer/tensorboard picks these up)
+            if metrics_dict is not None:
+                metrics_dict["global_rms"] = global_rms.detach()
+                metrics_dict["delta_rms"] = delta_rms.detach()
         return loss_dict
 
     def get_image_metrics_and_images(
