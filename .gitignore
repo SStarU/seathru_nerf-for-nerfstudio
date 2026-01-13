@@ -6,3 +6,4 @@ seathru_nerf.egg-info/*
 seathru/outputs/
 outputs/
 **/outputs/
+seathru/ns-train-help.txt

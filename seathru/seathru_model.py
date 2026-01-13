@@ -495,6 +495,9 @@ class SeathruModel(Model):
         """
         loss_dict = {}
         image = batch["image"].to(self.device)
+        if not hasattr(self, "_printed_batch_keys"):
+            print(f"batch keys: {sorted(list(batch.keys()))}")
+            self._printed_batch_keys = True
 
         # RGB loss
         if self.config.rgb_loss_use_bayer_mask:

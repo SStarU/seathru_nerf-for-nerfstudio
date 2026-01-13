@@ -3,7 +3,7 @@ import copy
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.plugins.types import MethodSpecification
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
-from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManagerConfig
+from seathru.seathru_datamanager import SeathruDataManagerConfig
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
@@ -41,10 +41,12 @@ seathru_method = MethodSpecification(
         max_num_iterations=100000,
         mixed_precision=True,
         pipeline=VanillaPipelineConfig(
-            datamanager=VanillaDataManagerConfig(
+            datamanager=SeathruDataManagerConfig(
                 dataparser=NerfstudioDataParserConfig(),
                 train_num_rays_per_batch=16384,
                 eval_num_rays_per_batch=4096,
+                use_clean_supervision=True,
+                use_depth_supervision=True,
                 #images_on_gpu=True,
             ),
             model=SeathruModelConfig(
@@ -105,10 +107,12 @@ seathru_method_lite = MethodSpecification(
         max_num_iterations=30000,#50k
         mixed_precision=True,
         pipeline=VanillaPipelineConfig(
-            datamanager=VanillaDataManagerConfig(
+            datamanager=SeathruDataManagerConfig(
                 dataparser=NerfstudioDataParserConfig(),
                 train_num_rays_per_batch=8192,#8192
                 eval_num_rays_per_batch=4096,
+                use_clean_supervision=True,
+                use_depth_supervision=True,
                 #images_on_gpu=True,
             ),
             model=SeathruModelConfig(
