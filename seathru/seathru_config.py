@@ -19,6 +19,8 @@ def _clone_method(
     description: str,
     use_medium_c1: bool,
     use_plan_b: bool = False,
+    use_clean_supervision: bool = False,
+    use_depth_supervision: bool = False,
 ) -> MethodSpecification:
     """Deep-copy a MethodSpecification and override C1/Plan-B toggles."""
     spec = copy.deepcopy(base)
@@ -28,6 +30,16 @@ def _clone_method(
     model_cfg = spec.config.pipeline.model
     model_cfg.use_medium_c1 = use_medium_c1
     model_cfg.use_plan_b = use_plan_b
+
+    dm_cfg = spec.config.pipeline.datamanager
+    if isinstance(dm_cfg, SeathruDataManagerConfig):
+        dm_cfg.use_clean_supervision = use_clean_supervision
+        dm_cfg.use_depth_supervision = use_depth_supervision
+        if use_clean_supervision:
+            dm_cfg.clean_dirname = "seasplat_clean"
+        if use_depth_supervision:
+            dm_cfg.depth_dirname = "seasplat_depth"
+            dm_cfg.depth_ext = "npy"
 
     return spec
 
@@ -45,8 +57,8 @@ seathru_method = MethodSpecification(
                 dataparser=NerfstudioDataParserConfig(),
                 train_num_rays_per_batch=16384,
                 eval_num_rays_per_batch=4096,
-                use_clean_supervision=True,
-                use_depth_supervision=True,
+                use_clean_supervision=False,
+                use_depth_supervision=False,
                 #images_on_gpu=True,
             ),
             model=SeathruModelConfig(
@@ -88,6 +100,8 @@ seathru_method_c1 = _clone_method(
     method_name="seathru-nerf-c1",
     description="SeaThru-NeRF for underwater scenes (C1 on).",
     use_medium_c1=True,
+    use_clean_supervision=False,
+    use_depth_supervision=False,
 )
 
 seathru_method_c1b = _clone_method(
@@ -96,7 +110,12 @@ seathru_method_c1b = _clone_method(
     description="SeaThru-NeRF for underwater scenes (C1 + plan B).",
     use_medium_c1=True,
     use_plan_b=True,
+    use_clean_supervision=True,
+    use_depth_supervision=True,
 )
+seathru_method_c1b.config.pipeline.model.object_density_bias = -4.0
+seathru_method_c1b.config.pipeline.model.lambda_clean = 0.0
+seathru_method_c1b.config.pipeline.model.lambda_depth = 0.0
 
 # Lite method configuration
 seathru_method_lite = MethodSpecification(
@@ -111,8 +130,8 @@ seathru_method_lite = MethodSpecification(
                 dataparser=NerfstudioDataParserConfig(),
                 train_num_rays_per_batch=8192,#8192
                 eval_num_rays_per_batch=4096,
-                use_clean_supervision=True,
-                use_depth_supervision=True,
+                use_clean_supervision=False,
+                use_depth_supervision=False,
                 #images_on_gpu=True,
             ),
             model=SeathruModelConfig(
@@ -178,6 +197,8 @@ seathru_method_lite_c1 = _clone_method(
     method_name="seathru-nerf-lite-c1",
     description="Light SeaThru-NeRF for underwater scenes (C1 on).",
     use_medium_c1=True,
+    use_clean_supervision=False,
+    use_depth_supervision=False,
 )
 
 seathru_method_lite_c1b = _clone_method(
@@ -186,4 +207,9 @@ seathru_method_lite_c1b = _clone_method(
     description="Light SeaThru-NeRF for underwater scenes (C1 + plan B).",
     use_medium_c1=True,
     use_plan_b=True,
+    use_clean_supervision=True,
+    use_depth_supervision=True,
 )
+seathru_method_lite_c1b.config.pipeline.model.object_density_bias = -4.0
+seathru_method_lite_c1b.config.pipeline.model.lambda_clean = 0.0
+seathru_method_lite_c1b.config.pipeline.model.lambda_depth = 0.0

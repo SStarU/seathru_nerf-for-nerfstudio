@@ -42,6 +42,9 @@ class SeathruDataManager(VanillaDataManager):
     _clean_cache: List[Optional[torch.Tensor]]
     _depth_cache: List[Optional[torch.Tensor]]
     _mask_cache: List[Optional[torch.Tensor]]
+    _depth_clip_lo: List[Optional[float]]
+    _depth_clip_hi: List[Optional[float]]
+    _depth_dir_example: Optional[Path]
     _clean_dir_exists: bool
     _depth_dir_exists: bool
     _clean_found_count: int
@@ -59,6 +62,9 @@ class SeathruDataManager(VanillaDataManager):
         self._clean_cache = []
         self._depth_cache = []
         self._mask_cache = []
+        self._depth_clip_lo = []
+        self._depth_clip_hi = []
+        self._depth_dir_example = None
         self._clean_dir_exists = False
         self._depth_dir_exists = False
         self._clean_found_count = 0
@@ -83,6 +89,8 @@ class SeathruDataManager(VanillaDataManager):
                 self._clean_dir_exists = True
             if depth_dir.is_dir():
                 self._depth_dir_exists = True
+                if self._depth_dir_example is None:
+                    self._depth_dir_example = depth_dir
 
             clean_path = clean_dir / f"{image_path.stem}.png"
             depth_path = depth_dir / f"{image_path.stem}.{self.config.depth_ext}"
@@ -109,6 +117,8 @@ class SeathruDataManager(VanillaDataManager):
         self._clean_cache = [None] * num_images
         self._depth_cache = [None] * num_images
         self._mask_cache = [None] * num_images
+        self._depth_clip_lo = [None] * num_images
+        self._depth_clip_hi = [None] * num_images
 
         if self.config.preload_supervision:
             for idx in range(num_images):
@@ -131,9 +141,15 @@ class SeathruDataManager(VanillaDataManager):
         if self.config.use_depth_supervision:
             missing = num_images - self._depth_found_count
             status = "found" if self._depth_dir_exists else "missing"
+            depth_path = str(self._depth_dir_example) if self._depth_dir_example is not None else "None"
+            example = ""
+            for lo, hi in zip(self._depth_clip_lo, self._depth_clip_hi):
+                if lo is not None and hi is not None:
+                    example = f", lo={lo:.6f}, hi={hi:.6f}"
+                    break
             CONSOLE.print(
-                f"[SeathruDataManager] depth dir {status}, "
-                f"loaded {self._depth_loaded_count}, missing {missing}"
+                f"[SeathruDataManager] depth dir {status}, path {depth_path}, "
+                f"loaded {self._depth_loaded_count}, missing {missing}{example}"
             )
 
     def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
@@ -208,13 +224,16 @@ class SeathruDataManager(VanillaDataManager):
                 raise RuntimeError(f"Missing depth supervision for cam {cam_idx}")
             return None
         target_hw = self._get_image_hw(cam_idx) if self.config.resize_to_image else None
-        depth, mask = self._load_depth_tensor(path, target_hw)
+        depth, mask, lo, hi = self._load_depth_tensor(path, target_hw)
         if depth is None or mask is None:
             if self.config.strict_supervision:
                 raise RuntimeError(f"Failed to load depth supervision for cam {cam_idx}")
             return None
         self._depth_cache[cam_idx] = depth
         self._mask_cache[cam_idx] = mask
+        if lo is not None and hi is not None:
+            self._depth_clip_lo[cam_idx] = lo
+            self._depth_clip_hi[cam_idx] = hi
         return depth
 
     def _load_clean_tensor(self, path: Path, target_hw: Optional[Tuple[int, int]]) -> Optional[torch.Tensor]:
@@ -235,7 +254,9 @@ class SeathruDataManager(VanillaDataManager):
 
     def _load_depth_tensor(
         self, path: Path, target_hw: Optional[Tuple[int, int]]
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[float], Optional[float]]:
+        lo = None
+        hi = None
         try:
             if self.config.depth_ext == "npy":
                 depth = np.load(path)
@@ -244,10 +265,28 @@ class SeathruDataManager(VanillaDataManager):
             if depth.ndim == 3:
                 depth = depth[:, :, 0]
             if depth.ndim != 2:
-                return None, None
+                return None, None, None, None
             depth = depth.astype(np.float32)
+            base_valid = np.isfinite(depth) & (depth > 0)
+            valid_count = int(base_valid.sum())
+            if valid_count >= 1000:
+                try:
+                    lo_val, hi_val = np.quantile(depth[base_valid], [0.001, 0.999])
+                    if np.isfinite(lo_val) and np.isfinite(hi_val) and hi_val > lo_val:
+                        ratio = lo_val / hi_val
+                        if np.isfinite(ratio):
+                            lo = float(lo_val)
+                            hi = float(hi_val)
+                except Exception:
+                    lo = None
+                    hi = None
+            if lo is not None and hi is not None:
+                depth = np.clip(depth, lo, hi)
+                mask = base_valid & (depth >= lo) & (depth <= hi)
+            else:
+                mask = base_valid
             depth_t = torch.from_numpy(depth)
-            mask_t = torch.isfinite(depth_t) & (depth_t > 0)
+            mask_t = torch.from_numpy(mask)
             if target_hw is not None and (depth_t.shape[0] != target_hw[0] or depth_t.shape[1] != target_hw[1]):
                 depth_t = depth_t.unsqueeze(0).unsqueeze(0)
                 mask_f = mask_t.to(torch.float32).unsqueeze(0).unsqueeze(0)
@@ -255,9 +294,9 @@ class SeathruDataManager(VanillaDataManager):
                 mask_f = F.interpolate(mask_f, size=target_hw, mode="nearest")
                 depth_t = depth_t.squeeze(0).squeeze(0).contiguous()
                 mask_t = mask_f.squeeze(0).squeeze(0) > 0.5
-            return depth_t, mask_t
+            return depth_t, mask_t, lo, hi
         except Exception:
-            return None, None
+            return None, None, None, None
 
     def _gather_clean(self, indices: torch.Tensor) -> Optional[torch.Tensor]:
         indices_cpu = indices.detach().to("cpu")

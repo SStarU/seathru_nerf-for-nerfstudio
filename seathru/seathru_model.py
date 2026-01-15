@@ -81,6 +81,30 @@ class SeathruModelConfig(ModelConfig):
     """Whether to use global + per-image medium pre-activation bias (C1)."""
     use_plan_b: bool = False
     """Whether to enable plan B variant for SeaThru."""
+    lambda_clean: float = 0.003
+    """Weight for clean RGB supervision loss."""
+    lambda_depth: float = 0.005
+    """Weight for depth supervision loss."""
+    depth_loss_type: Literal["l1", "scale_shift_invariant"] = "scale_shift_invariant"
+    """Depth loss type when depth supervision is available."""
+    log_depth_stats: bool = True
+    """Whether to log depth alignment error stats to metrics."""
+    aux_ramp_start: int = 3000
+    """Start step for ramping auxiliary supervision weights."""
+    aux_ramp_end: int = 15000
+    """End step for ramping auxiliary supervision weights."""
+    acc_mask_thresh: float = 0.1
+    """Threshold for gating depth supervision by NeRF accumulation."""
+    keep_depth: float = 0.3
+    """Target keep ratio for depth supervision by accumulation."""
+    keep_clean: float = 0.5
+    """Target keep ratio for clean supervision by accumulation."""
+    peak_quantile: float = 0.7
+    """Quantile for peak gating in depth/clean supervision."""
+    peak_mask_fixed_thr: float = 0.02
+    """Fixed threshold for peak gating when batch is tiny."""
+    peak_min_batch: int = 256
+    """Minimum batch size to use quantile-based peak gating."""
     medium_delta_dim: int = 8
     """Embedding dimension for per-image medium residuals."""
     lambda_delta: float = 1e-3
@@ -173,6 +197,7 @@ class SeathruModel(Model):
     def populate_modules(self):
         """Setup the fields and modules."""
         super().populate_modules()
+        self.use_plan_b = getattr(self.config, "use_plan_b", False)
 
         # Scene contraction
         if self.config.disable_scene_contraction:
@@ -402,6 +427,20 @@ class SeathruModel(Model):
             field_outputs[FieldHeadNames.DENSITY], nan=1e-3
         )
         weights = ray_samples.get_weights(field_outputs[FieldHeadNames.DENSITY])
+        if self.training and self.step == 0:
+            w = weights.detach()
+            print(
+                "[DEBUG weights] shape",
+                tuple(w.shape),
+                "min",
+                float(w.min()),
+                "max",
+                float(w.max()),
+                "sum_ray_p50",
+                float(w.sum(dim=1).median()),
+                "sum_ray_mean",
+                float(w.sum(dim=1).mean()),
+            )
         weights_list.append(weights)
         ray_samples_list.append(ray_samples)
 
@@ -432,8 +471,15 @@ class SeathruModel(Model):
                 ray_samples=ray_samples,
             )
 
-        # Render depth and accumulation
-        depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
+        # Render clean RGB (object only) and expected depth
+        weights_detached = weights.detach()
+        rgb_clean = torch.sum(weights_detached * field_outputs[FieldHeadNames.RGB], dim=1)
+        t_mid = (ray_samples.frustums.starts + ray_samples.frustums.ends) * 0.5
+        depth = torch.sum(weights * t_mid, dim=-2).to(torch.float32)
+        acc = torch.sum(weights, dim=1).to(torch.float32)
+        w_peak = weights.max(dim=1).values.to(torch.float32)
+
+        # Render accumulation
         accumulation = self.renderer_accumulation(weights=weights)
 
         # Calculate transmittance and add to outputs for acc_loss calculation
@@ -444,6 +490,9 @@ class SeathruModel(Model):
         outputs = {
             "rgb": rgb,
             "depth": depth,
+            "rgb_clean": rgb_clean,
+            "acc": acc,
+            "w_peak": w_peak,
             "accumulation": accumulation,
             "transmittance": transmittance,
             "weights": weights,
@@ -495,9 +544,59 @@ class SeathruModel(Model):
         """
         loss_dict = {}
         image = batch["image"].to(self.device)
-        if not hasattr(self, "_printed_batch_keys"):
-            print(f"batch keys: {sorted(list(batch.keys()))}")
-            self._printed_batch_keys = True
+
+        def _log_metric(name: str, value: torch.Tensor) -> None:
+            if metrics_dict is not None:
+                metrics_dict[name] = value.detach()
+            else:
+                loss_dict[name] = value
+
+        start = self.config.aux_ramp_start
+        end = self.config.aux_ramp_end
+        if self.step <= start:
+            w_aux = 0.0
+        elif self.step >= end:
+            w_aux = 1.0
+        else:
+            w_aux = float(self.step - start) / float(end - start)
+        loss_dict["aux_weight"] = torch.tensor(w_aux, device=self.device)
+
+        peak_mask = None
+        if "w_peak" in outputs:
+            peak = outputs["w_peak"].detach().view(-1)
+            if peak.numel() > 0:
+                peak_min = peak.min()
+                peak_max = peak.max()
+                if peak.numel() < self.config.peak_min_batch:
+                    peak_thr = torch.as_tensor(
+                        self.config.peak_mask_fixed_thr,
+                        device=peak.device,
+                        dtype=peak.dtype,
+                    )
+                    peak_mask = peak > peak_thr
+                    peak_thr_mode = 0
+                elif (peak_max - peak_min) < 1e-6:
+                    peak_thr = peak_min
+                    peak_mask = peak >= peak_thr
+                    peak_thr_mode = 1
+                else:
+                    peak_thr = torch.quantile(peak, self.config.peak_quantile)
+                    peak_mask = peak > peak_thr
+                    if peak_mask.float().mean().item() == 0.0:
+                        k = max(1, int(0.3 * peak.numel()))
+                        topk_idx = torch.topk(peak, k, largest=True).indices
+                        peak_mask = torch.zeros_like(peak, dtype=torch.bool)
+                        peak_mask[topk_idx] = True
+                        peak_thr_mode = 2
+                    else:
+                        peak_thr_mode = 3
+                loss_dict["peak_thr"] = peak_thr
+                loss_dict["peak_gate_ratio"] = peak_mask.float().mean()
+                loss_dict["peak_p50"] = peak.median()
+                loss_dict["peak_mean"] = peak.mean()
+                loss_dict["peak_thr_mode"] = torch.as_tensor(
+                    peak_thr_mode, device=peak.device, dtype=peak.dtype
+                )
 
         # RGB loss
         if self.config.rgb_loss_use_bayer_mask:
@@ -510,6 +609,94 @@ class SeathruModel(Model):
             loss_dict["rgb_loss"] = torch.sum(loss * bayer_mask) / denom
         else:
             loss_dict["rgb_loss"] = recon_loss(gt=image, pred=outputs["rgb"])
+
+        # Clean RGB supervision (optional)
+        if "clean_image" in batch and "rgb_clean" in outputs and "acc" in outputs:
+            acc_flat = outputs["acc"].detach().view(-1)
+            if acc_flat.numel() < 256:
+                thr_clean = torch.as_tensor(
+                    self.config.acc_mask_thresh, device=acc_flat.device, dtype=acc_flat.dtype
+                )
+            else:
+                thr_clean = torch.quantile(acc_flat, 1.0 - self.config.keep_clean)
+            acc_mask_clean = acc_flat > thr_clean
+            if "depth_mask" in batch:
+                final_mask = acc_mask_clean.view(-1, 1) & batch["depth_mask"].to(self.device).bool()
+            else:
+                final_mask = acc_mask_clean.view(-1, 1)
+            if peak_mask is not None:
+                final_mask = final_mask & peak_mask.view(-1, 1)
+            loss_dict["acc_thr_clean"] = thr_clean
+            loss_dict["acc_gate_ratio_clean"] = acc_mask_clean.float().mean()
+            loss_dict["clean_valid_ratio"] = final_mask.float().mean()
+            valid_mask = final_mask.view(-1)
+            if valid_mask.sum().item() >= 64:
+                clean_pred = outputs["rgb_clean"][valid_mask]
+                clean_gt = batch["clean_image"].to(self.device)[valid_mask]
+                clean_loss_raw = recon_loss(gt=clean_gt, pred=clean_pred)
+                loss_dict["clean_loss"] = self.config.lambda_clean * clean_loss_raw
+                loss_dict["clean_loss"] *= w_aux
+                _log_metric("clean_loss_raw", clean_loss_raw)
+
+        # Depth supervision (optional)
+        if (
+            "depth" in batch
+            and "depth_mask" in batch
+            and "depth" in outputs
+            and "acc" in outputs
+        ):
+            pred = outputs["depth"].to(self.device)
+            gt = batch["depth"].to(self.device)
+            base_mask = batch["depth_mask"].to(self.device).bool()
+            acc = outputs["acc"].detach().view(-1)
+            if acc.numel() < 256:
+                thr_depth = torch.as_tensor(
+                    self.config.acc_mask_thresh, device=acc.device, dtype=acc.dtype
+                )
+            else:
+                thr_depth = torch.quantile(acc, 1.0 - self.config.keep_depth)
+            acc_mask = acc > thr_depth
+            final_mask = base_mask & acc_mask.view(-1, 1)
+            if peak_mask is not None:
+                final_mask = final_mask & peak_mask.view(-1, 1)
+            loss_dict["acc_min"] = acc.min()
+            loss_dict["acc_max"] = acc.max()
+            loss_dict["acc_p50"] = acc.median()
+            loss_dict["acc_gate_ratio_depth"] = acc_mask.float().mean()
+            loss_dict["acc_thr_depth"] = thr_depth
+            loss_dict["depth_valid_ratio"] = final_mask.float().mean()
+            loss_dict["acc_mean"] = outputs["acc"].mean()
+            valid_mask = final_mask.view(-1)
+            if valid_mask.sum().item() >= 64:
+                try:
+                    p = pred.view(-1)[valid_mask]
+                    g = gt.view(-1)[valid_mask]
+                    pd = p.detach()
+                    gd = g.detach()
+                    ones = torch.ones_like(pd)
+                    A = torch.stack([pd, ones], dim=1)
+                    try:
+                        x = torch.linalg.lstsq(A, gd).solution
+                    except Exception:
+                        eps = 1e-6
+                        AtA = A.T @ A
+                        Atg = A.T @ gd
+                        x = torch.linalg.solve(
+                            AtA + eps * torch.eye(2, device=AtA.device, dtype=AtA.dtype),
+                            Atg,
+                        )
+                    s = x[0]
+                    t = x[1]
+                    s_clamped = torch.clamp(s, 0.1, 10.0)
+                    aligned = s_clamped * p + t
+                    depth_err = torch.mean(torch.abs(aligned - g))
+                    loss_dict["depth_err"] = depth_err
+                    loss_dict["depth_scale"] = s_clamped
+                    loss_dict["depth_shift"] = t
+                    loss_dict["depth_loss"] = self.config.lambda_depth * depth_err
+                    loss_dict["depth_loss"] *= w_aux
+                except Exception:
+                    pass
 
         if self.training:
             # Accumulation loss
@@ -574,6 +761,8 @@ class SeathruModel(Model):
             if metrics_dict is not None:
                 metrics_dict["global_rms"] = global_rms.detach()
                 metrics_dict["delta_rms"] = delta_rms.detach()
+        if self.training and self.step == 0:
+            print("[DEBUG loss_dict keys]", sorted(loss_dict.keys()))
         return loss_dict
 
     def get_image_metrics_and_images(
